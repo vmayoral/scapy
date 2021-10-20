@@ -1,5 +1,6 @@
 % Regression tests for ISOTPSoftSocket
 ~ automotive_comm
+~ disabled
 
 + Configuration
 ~ conf
