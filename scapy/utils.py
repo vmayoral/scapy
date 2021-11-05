@@ -1413,6 +1413,7 @@ class RawPcapNgReader(RawPcapReader):
             2: self._read_block_pkt,
             3: self._read_block_spb,
             6: self._read_block_epb,
+            10: self._read_block_dsb,
         }
         self.endian = "!"  # Will be overwritten by first SHB
 
@@ -1606,6 +1607,58 @@ class RawPcapNgReader(RawPcapReader):
                                                tshigh=tshigh,
                                                tslow=tslow,
                                                wirelen=wirelen))
+
+    def _read_block_dsb(self, block, size):
+        # type: (bytes, int) -> None
+        """Decryption Secrets Block"""
+
+        # Parse the secrets type and length fields
+        try:
+            secrets_type, secrets_length = struct.unpack(
+                self.endian + "II",
+                block[:8],
+            )
+            block = block[8:]
+        except struct.error:
+            warning("PcapNg: DSB is too small %d!", len(block))
+            raise EOFError
+
+        # Compute the secrets length including the padding
+        padded_secrets_length = secrets_length + (4 - secrets_length % 4)
+        if len(block) < padded_secrets_length:
+            warning("PcapNg: invalid DSB secrets length!")
+            raise EOFError
+
+        # Extract secrets data and options
+        secrets_data = block[:padded_secrets_length][:secrets_length]
+        if block[padded_secrets_length:]:
+            warning("PcapNg: DSB options are not supported!")
+
+        # TLS Key Log
+        if secrets_type == 0x544c534b:
+            if getattr(conf, "tls_nss_keys", False) is False:
+                warning("PcapNg: TLS Key Log available, but "
+                        "the TLS layer is not loaded! Scapy won't be able "
+                        "to decrypt the packets.")
+            else:
+                from scapy.layers.tls.session import load_nss_keys
+
+                # Write Key Log to a file and parse it
+                filename = get_temp_file()
+                with open(filename, "wb") as fd:
+                    fd.write(secrets_data)
+                    fd.close()
+
+                keys = load_nss_keys(filename)
+                if not keys:
+                    warning("PcapNg: invalid TLS Key Log in DSB!")
+                else:
+                    # Note: these attributes are only available when the TLS
+                    #       layer is loaded.
+                    conf.tls_nss_keys = keys  # type: ignore
+                    conf.tls_session_enable = True  # type: ignore
+        else:
+            warning("PcapNg: Unknown DSB secrets type (0x%x)!", secrets_type)
 
 
 class PcapNgReader(RawPcapNgReader, PcapReader, _SuperSocket):
@@ -2154,7 +2207,17 @@ def tcpdump(
         if linktype is None and isinstance(pktlist, str):
             # linktype is unknown but required. Read it from file
             with PcapReader(pktlist) as rd:
-                linktype = rd.linktype
+                if isinstance(rd, PcapNgReader):
+                    # Get the linktype from the first packet
+                    try:
+                        _, metadata = rd._read_packet()
+                        linktype = metadata.linktype
+                    except EOFError:
+                        raise ValueError(
+                            "Cannot get linktype from a PcapNg packet."
+                        )
+                else:
+                    linktype = rd.linktype
         from scapy.arch.common import compile_filter
         compile_filter(flt, linktype=linktype)
         args.append(flt)
@@ -2299,7 +2362,7 @@ def get_terminal_width():
             return sizex
     # Backups / Python 2.7
     if WINDOWS:
-        from ctypes import windll, create_string_buffer  # type: ignore
+        from ctypes import windll, create_string_buffer
         # http://code.activestate.com/recipes/440694-determine-size-of-console-window-on-windows/
         h = windll.kernel32.GetStdHandle(-12)
         csbi = create_string_buffer(22)
